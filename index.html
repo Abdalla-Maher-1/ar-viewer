@@ -1,0 +1,413 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Steady AR Viewer</title>
+<style>
+  :root { --bg:#101418; --panel:#1b2229; --line:#2c3640; --text:#eef2f5; --dim:#9aa7b3; --accent:#3ddc84; --warn:#ffb74d; }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--text);
+    font-family:system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  canvas { position:fixed; inset:0; width:100%; height:100%; display:block; }
+  #overlay { position:fixed; inset:0; pointer-events:none; }
+  #overlay > * { pointer-events:auto; }
+
+  #home { position:absolute; inset:0; background:var(--bg); overflow:auto;
+    padding:28px 20px 40px; display:flex; flex-direction:column; gap:16px; }
+  #home h1 { font-size:24px; margin:0; letter-spacing:-0.01em; }
+  #home p { margin:0; color:var(--dim); line-height:1.5; font-size:15px; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:16px;
+    display:flex; flex-direction:column; gap:12px; }
+  .card h2 { font-size:13px; margin:0; color:var(--dim); font-weight:600; text-transform:uppercase; letter-spacing:.06em; }
+  #fileName { font-size:15px; word-break:break-all; }
+  ol { margin:0; padding-left:20px; color:var(--dim); line-height:1.6; font-size:14px; }
+
+  button, .filebtn { font:inherit; font-weight:600; font-size:16px; color:var(--text);
+    background:#26303a; border:1px solid var(--line); border-radius:12px;
+    min-height:52px; padding:0 18px; display:inline-flex; align-items:center; justify-content:center; cursor:pointer; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#06210f; }
+  button:disabled { opacity:.45; }
+  .filebtn input { display:none; }
+
+  #hud { position:absolute; left:0; right:0; top:0; padding:14px 14px 0; display:none; }
+  #status { background:rgba(16,20,24,.78); border-radius:12px; padding:11px 14px; font-size:15px; line-height:1.35; }
+  #status.ready { color:var(--accent); }
+  #status.warn { color:var(--warn); }
+
+  #bar { position:absolute; left:0; right:0; bottom:0; padding:12px 14px 22px; display:none;
+    flex-direction:column; gap:10px; background:linear-gradient(transparent, rgba(16,20,24,.85) 30%); }
+  .row { display:flex; gap:10px; align-items:center; }
+  .row > button { flex:1; }
+  .slider { display:none; background:rgba(27,34,41,.9); border-radius:12px; padding:8px 12px; align-items:center; gap:10px; font-size:13px; color:var(--dim); }
+  .slider span.name { width:52px; }
+  .slider span.val { width:64px; text-align:right; color:var(--text); font-variant-numeric:tabular-nums; }
+  .slider input { flex:1; height:36px; accent-color:var(--accent); }
+  .slider button { min-height:36px; padding:0 10px; font-size:13px; }
+  #exit { flex:0 0 auto; }
+</style>
+<script type="importmap">
+{ "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="overlay">
+  <div id="home">
+    <h1>Steady AR Viewer</h1>
+    <p>Places a 3D model on the floor once, pins it there, and keeps it locked until you choose to move it.</p>
+
+    <div class="card">
+      <h2>Model</h2>
+      <div id="fileName">Demo cube (30 cm)</div>
+      <label class="filebtn">Choose a GLB file
+        <input id="file" type="file" accept=".glb,.gltf,model/gltf-binary">
+      </label>
+    </div>
+
+    <div class="card">
+      <h2>How to use</h2>
+      <ol>
+        <li>Start AR and point the phone at the floor, tilted down.</li>
+        <li>Move slowly side to side until the ring turns green.</li>
+        <li>Tap <b>Place here</b>. The model is now locked.</li>
+        <li>Use the sliders to rotate and resize. Tap <b>Move</b> to re-place.</li>
+      </ol>
+    </div>
+
+    <button id="start" class="primary" disabled>Checking AR support…</button>
+    <p id="homeMsg"></p>
+  </div>
+
+  <div id="hud"><div id="status">Looking for the floor…</div></div>
+
+  <div id="bar">
+    <div class="slider" id="rotRow">
+      <span class="name">Rotate</span>
+      <input id="rot" type="range" min="0" max="360" step="1" value="0">
+      <span class="val" id="rotVal">0°</span>
+    </div>
+    <div class="slider" id="sclRow">
+      <span class="name">Size</span>
+      <input id="scl" type="range" min="-4" max="4" step="0.02" value="0">
+      <span class="val" id="sclVal"></span>
+      <button id="sclReset">1:1</button>
+    </div>
+    <div class="row">
+      <button id="place" class="primary" disabled>Place here</button>
+      <button id="move" style="display:none">Move</button>
+      <button id="exit">Exit</button>
+    </div>
+  </div>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
+import { MeshoptDecoder } from 'three/addons/libs/meshopt_decoder.module.js';
+
+const $ = id => document.getElementById(id);
+const ui = {
+  overlay: $('overlay'), home: $('home'), hud: $('hud'), bar: $('bar'), status: $('status'),
+  start: $('start'), homeMsg: $('homeMsg'), file: $('file'), fileName: $('fileName'),
+  place: $('place'), move: $('move'), exit: $('exit'),
+  rotRow: $('rotRow'), sclRow: $('sclRow'), rot: $('rot'), rotVal: $('rotVal'),
+  scl: $('scl'), sclVal: $('sclVal'), sclReset: $('sclReset')
+};
+
+// How many steady frames are needed before placing is allowed.
+const STABLE_FRAMES = 20;
+
+// ---------- scene ----------
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.xr.enabled = true;
+renderer.xr.setReferenceSpaceType('local');
+document.body.prepend(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.01, 50);
+scene.add(new THREE.HemisphereLight(0xffffff, 0x8899aa, 2.2));
+const sun = new THREE.DirectionalLight(0xffffff, 1.6);
+sun.position.set(1, 3, 2);
+scene.add(sun);
+
+const reticleMat = new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.9 });
+const reticle = new THREE.Mesh(new THREE.RingGeometry(0.075, 0.095, 40).rotateX(-Math.PI / 2), reticleMat);
+reticle.visible = false;
+scene.add(reticle);
+
+const holder = new THREE.Group();   // follows the anchor
+const pivot = new THREE.Group();    // user rotation and scale
+holder.add(pivot);
+holder.visible = false;
+scene.add(holder);
+
+const shadow = new THREE.Mesh(
+  new THREE.CircleGeometry(0.5, 40).rotateX(-Math.PI / 2),
+  new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.22, depthWrite: false })
+);
+shadow.position.y = 0.002;
+holder.add(shadow);
+
+let baseScale = 1;       // scale that gives the model its starting size
+let modelSize = new THREE.Vector3(0.3, 0.3, 0.3);   // size at scale 1, metres
+let fitNote = '';
+
+function setModel(object) {
+  pivot.clear();
+  // Sit the model on the floor, centred on its footprint.
+  const box = new THREE.Box3().setFromObject(object);
+  const size = box.getSize(new THREE.Vector3());
+  const centre = box.getCenter(new THREE.Vector3());
+  object.position.x -= centre.x;
+  object.position.z -= centre.z;
+  object.position.y -= box.min.y;
+  pivot.add(object);
+
+  modelSize = size;
+  const largest = Math.max(size.x, size.y, size.z) || 1;
+  // Files in the wrong unit come out huge or tiny; start those at 50 cm.
+  if (largest > 3 || largest < 0.02) {
+    baseScale = 0.5 / largest;
+    fitNote = ' (auto-fitted to 50 cm)';
+  } else {
+    baseScale = 1;
+    fitNote = '';
+  }
+  ui.scl.value = 0;
+  ui.rot.value = 0;
+  applyTransform();
+}
+
+function applyTransform() {
+  const s = baseScale * Math.pow(2, parseFloat(ui.scl.value));
+  pivot.scale.setScalar(s);
+  pivot.rotation.y = THREE.MathUtils.degToRad(parseFloat(ui.rot.value));
+  const footprint = Math.max(modelSize.x, modelSize.z) * s;
+  shadow.scale.setScalar(Math.max(footprint * 1.15, 0.05));
+  const largest = Math.max(modelSize.x, modelSize.y, modelSize.z) * s;
+  ui.sclVal.textContent = largest >= 1 ? largest.toFixed(2) + ' m' : Math.round(largest * 100) + ' cm';
+  ui.rotVal.textContent = Math.round(ui.rot.value) + '°';
+}
+
+function demoModel() {
+  const mesh = new THREE.Mesh(
+    new THREE.BoxGeometry(0.3, 0.3, 0.3),
+    new THREE.MeshStandardMaterial({ color: 0x3ddc84, roughness: 0.55 })
+  );
+  return mesh;
+}
+setModel(demoModel());
+
+// ---------- loading a GLB ----------
+const loader = new GLTFLoader();
+const draco = new DRACOLoader();
+draco.setDecoderPath('https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/libs/draco/');
+loader.setDRACOLoader(draco);
+loader.setMeshoptDecoder(MeshoptDecoder);
+
+ui.file.addEventListener('change', () => {
+  const f = ui.file.files && ui.file.files[0];
+  if (!f) return;
+  ui.fileName.textContent = 'Loading ' + f.name + '…';
+  const url = URL.createObjectURL(f);
+  loader.load(url, gltf => {
+    URL.revokeObjectURL(url);
+    setModel(gltf.scene);
+    ui.fileName.textContent = f.name + fitNote;
+  }, undefined, err => {
+    URL.revokeObjectURL(url);
+    ui.fileName.textContent = 'Could not load ' + f.name + '. Use a single .glb file.';
+    console.error(err);
+  });
+});
+
+// ---------- AR session ----------
+let session = null, hitSource = null, anchor = null;
+let mode = 'aim';            // 'aim' or 'placed'
+let stable = 0, misses = 0, placeRequested = false, lastHit = null;
+let lastUi = '';
+const smooth = new THREE.Vector3(), target = new THREE.Vector3(), normal = new THREE.Vector3();
+const mat = new THREE.Matrix4(), hitQuat = new THREE.Quaternion(), tmpScale = new THREE.Vector3();
+
+if (navigator.xr && navigator.xr.isSessionSupported) {
+  navigator.xr.isSessionSupported('immersive-ar').then(ok => {
+    if (ok) { ui.start.disabled = false; ui.start.textContent = 'Start AR'; }
+    else noAR('This browser reports that AR is not available on this phone.');
+  }).catch(() => noAR('Could not check AR support.'));
+} else {
+  noAR(window.isSecureContext
+    ? 'This browser has no WebXR. Open the page in Chrome.'
+    : 'AR needs a secure (https) address. Open this page from an https link in Chrome.');
+}
+function noAR(msg) { ui.start.textContent = 'AR not available'; ui.homeMsg.textContent = msg; }
+
+ui.start.addEventListener('click', async () => {
+  // Try the full setup first, then simpler ones, and report which step failed.
+  const attempts = [
+    ['full', { requiredFeatures: ['hit-test'], optionalFeatures: ['anchors', 'dom-overlay'], domOverlay: { root: ui.overlay } }],
+    ['hit-test only', { requiredFeatures: ['hit-test'] }],
+    ['plain', {}]
+  ];
+  const log = [];
+  let used = '';
+  for (const [name, init] of attempts) {
+    try {
+      session = await navigator.xr.requestSession('immersive-ar', init);
+      used = name;
+      break;
+    } catch (e) {
+      log.push(name + ': ' + (e && e.name ? e.name + ' - ' : '') + (e && e.message ? e.message : e));
+    }
+  }
+  if (!session) {
+    ui.homeMsg.textContent = 'AR could not start. ' + log.join(' | ') +
+      ' | Browser: ' + navigator.userAgent;
+    return;
+  }
+  if (used !== 'full') {
+    // A simpler setup worked. End it and explain, since the controls need the full one.
+    await session.end();
+    session = null;
+    ui.homeMsg.textContent = 'AR starts only in "' + used + '" mode on this phone. Failed steps: ' + log.join(' | ');
+    return;
+  }
+  session.addEventListener('end', onEnd);
+  await renderer.xr.setSession(session);
+  try {
+    const viewer = await session.requestReferenceSpace('viewer');
+    hitSource = await session.requestHitTestSource({ space: viewer });
+  } catch (e) {
+    setStatus('Floor detection is not available in this session.', 'warn');
+  }
+  ui.home.style.display = 'none';
+  ui.hud.style.display = 'block';
+  ui.bar.style.display = 'flex';
+  enterAim();
+});
+
+function onEnd() {
+  session = null; hitSource = null; anchor = null; lastHit = null;
+  holder.visible = false; reticle.visible = false;
+  ui.home.style.display = 'flex';
+  ui.hud.style.display = 'none';
+  ui.bar.style.display = 'none';
+}
+ui.exit.addEventListener('click', () => { if (session) session.end(); });
+
+function setStatus(text, cls) {
+  const key = text + '|' + (cls || '');
+  if (key === lastUi) return;
+  lastUi = key;
+  ui.status.textContent = text;
+  ui.status.className = cls || '';
+}
+
+function enterAim() {
+  mode = 'aim'; stable = 0; misses = 0; placeRequested = false; lastHit = null;
+  if (anchor && anchor.delete) { try { anchor.delete(); } catch (e) {} }
+  anchor = null;
+  holder.visible = false;
+  ui.place.style.display = ''; ui.place.disabled = true;
+  ui.move.style.display = 'none';
+  ui.rotRow.style.display = 'none'; ui.sclRow.style.display = 'none';
+  setStatus('Looking for the floor… move the phone slowly side to side.');
+}
+
+function enterPlaced(hit) {
+  mode = 'placed';
+  holder.position.copy(smooth);
+  holder.quaternion.copy(hitQuat);
+  holder.visible = true;
+  reticle.visible = false;
+  ui.place.style.display = 'none';
+  ui.move.style.display = '';
+  ui.rotRow.style.display = 'flex'; ui.sclRow.style.display = 'flex';
+  setStatus('Locked in place. Touching the screen will not move it.', 'ready');
+  if (hit && hit.createAnchor) {
+    hit.createAnchor().then(a => {
+      if (mode === 'placed') anchor = a; else if (a.delete) a.delete();
+    }).catch(() => {
+      setStatus('Placed without an anchor, so it may drift a little.', 'warn');
+    });
+  } else {
+    setStatus('Placed without an anchor, so it may drift a little.', 'warn');
+  }
+}
+
+ui.place.addEventListener('click', () => { if (mode === 'aim' && stable >= STABLE_FRAMES) placeRequested = true; });
+ui.move.addEventListener('click', enterAim);
+ui.rot.addEventListener('input', applyTransform);
+ui.scl.addEventListener('input', applyTransform);
+ui.sclReset.addEventListener('click', () => { ui.scl.value = 0; applyTransform(); });
+
+renderer.setAnimationLoop((time, frame) => {
+  if (frame && session) {
+    const ref = renderer.xr.getReferenceSpace();
+
+    if (mode === 'aim' && hitSource && ref) {
+      const results = frame.getHitTestResults(hitSource);
+      let found = null;
+      for (const r of results) {
+        const p = r.getPose(ref);
+        if (!p) continue;
+        mat.fromArray(p.transform.matrix);
+        normal.setFromMatrixColumn(mat, 1);
+        // Keep only surfaces facing up, so walls and furniture sides are ignored.
+        if (normal.y > 0.92) { found = r; break; }
+      }
+      if (found) {
+        mat.decompose(target, hitQuat, tmpScale);
+        if (!reticle.visible) { smooth.copy(target); stable = 0; }
+        else {
+          // A sudden jump means the detected floor changed; start counting again.
+          if (target.distanceTo(smooth) > 0.25) stable = 0;
+          smooth.lerp(target, 0.2);
+        }
+        reticle.visible = true;
+        reticle.position.copy(smooth);
+        stable++; misses = 0; lastHit = found;
+      } else {
+        lastHit = null;
+        if (++misses > 10) { reticle.visible = false; stable = 0; }
+      }
+
+      const ready = stable >= STABLE_FRAMES && reticle.visible;
+      reticleMat.color.setHex(ready ? 0x3ddc84 : 0xffffff);
+      ui.place.disabled = !ready;
+      if (ready) setStatus('Floor found. Aim the ring and tap Place here.', 'ready');
+      else if (reticle.visible) setStatus('Hold steady…');
+      else setStatus('Looking for the floor… move the phone slowly side to side.');
+
+      if (placeRequested) {
+        placeRequested = false;
+        if (ready && lastHit) enterPlaced(lastHit);
+      }
+    }
+
+    if (mode === 'placed' && anchor && ref && frame.trackedAnchors && frame.trackedAnchors.has(anchor)) {
+      const ap = frame.getPose(anchor.anchorSpace, ref);
+      if (ap) {
+        const t = ap.transform;
+        holder.position.set(t.position.x, t.position.y, t.position.z);
+        holder.quaternion.set(t.orientation.x, t.orientation.y, t.orientation.z, t.orientation.w);
+      }
+    }
+  }
+  renderer.render(scene, camera);
+});
+
+window.addEventListener('resize', () => {
+  if (renderer.xr.isPresenting) return;
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+</script>
+</body>
+</html>
