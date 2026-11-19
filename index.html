@@ -319,10 +319,24 @@ function enterAim() {
   setStatus('Looking for the floor… move the phone slowly side to side.');
 }
 
+// Steadiness settings for a placed model.
+const DEADBAND = 0.04;    // anchor corrections smaller than 4 cm are ignored
+const SNAP = 0.35;        // corrections larger than 35 cm (tracking recovered) apply at once
+const FOLLOW = 0.03;      // otherwise the model eases toward the correction slowly
+const placedPos = new THREE.Vector3(), anchorStart = new THREE.Vector3(), anchorNow = new THREE.Vector3();
+const goalPos = new THREE.Vector3(), camPos = new THREE.Vector3();
+let anchorHasStart = false, easing = false;
+
 function enterPlaced(hit) {
   mode = 'placed';
   holder.position.copy(smooth);
-  holder.quaternion.copy(hitQuat);
+  placedPos.copy(smooth);
+  anchorHasStart = false; easing = false;
+  // Stand the model exactly upright and turn it to face you. Its rotation is never
+  // taken from tracking again, so a tall model cannot wobble from small tilt errors.
+  renderer.xr.getCamera().getWorldPosition(camPos);
+  holder.quaternion.setFromAxisAngle(new THREE.Vector3(0, 1, 0),
+    Math.atan2(camPos.x - smooth.x, camPos.z - smooth.z));
   holder.visible = true;
   reticle.visible = false;
   ui.place.style.display = 'none';
@@ -393,9 +407,18 @@ renderer.setAnimationLoop((time, frame) => {
     if (mode === 'placed' && anchor && ref && frame.trackedAnchors && frame.trackedAnchors.has(anchor)) {
       const ap = frame.getPose(anchor.anchorSpace, ref);
       if (ap) {
-        const t = ap.transform;
-        holder.position.set(t.position.x, t.position.y, t.position.z);
-        holder.quaternion.set(t.orientation.x, t.orientation.y, t.orientation.z, t.orientation.w);
+        const t = ap.transform.position;
+        anchorNow.set(t.x, t.y, t.z);
+        if (!anchorHasStart) { anchorStart.copy(anchorNow); anchorHasStart = true; }
+        // Only the anchor's position change is used, filtered so frame-to-frame
+        // jitter never reaches the model.
+        goalPos.copy(placedPos).add(anchorNow).sub(anchorStart);
+        const off = goalPos.distanceTo(holder.position);
+        if (off > SNAP) { holder.position.copy(goalPos); easing = false; }
+        else if (easing || off > DEADBAND) {
+          easing = off > 0.005;
+          holder.position.lerp(goalPos, FOLLOW);
+        }
       }
     }
   }
