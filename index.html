@@ -119,7 +119,7 @@ const ui = {
 };
 
 // How many steady frames are needed before placing is allowed.
-const STABLE_FRAMES = 20;
+const STABLE_FRAMES = 12;
 
 // ---------- scene ----------
 const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
@@ -360,27 +360,44 @@ ui.rot.addEventListener('input', applyTransform);
 ui.scl.addEventListener('input', applyTransform);
 ui.sclReset.addEventListener('click', () => { ui.scl.value = 0; applyTransform(); });
 
+let errorShown = false;
 renderer.setAnimationLoop((time, frame) => {
+  try { step(time, frame); }
+  catch (e) {
+    // Show the problem instead of silently freezing.
+    if (!errorShown) { errorShown = true; console.error(e); }
+    lastUi = '';
+    setStatus('Error: ' + (e && e.message ? e.message : e), 'warn');
+  }
+  renderer.render(scene, camera);
+});
+
+let tiltedFrames = 0;
+function step(time, frame) {
   if (frame && session) {
     const ref = renderer.xr.getReferenceSpace();
 
     if (mode === 'aim' && hitSource && ref) {
       const results = frame.getHitTestResults(hitSource);
       let found = null;
+      // Prefer surfaces facing straight up. If ARCore keeps reporting the floor as
+      // slightly tilted, accept a looser angle after about two seconds.
+      const minUp = tiltedFrames > 60 ? 0.7 : 0.92;
       for (const r of results) {
         const p = r.getPose(ref);
         if (!p) continue;
         mat.fromArray(p.transform.matrix);
         normal.setFromMatrixColumn(mat, 1);
-        // Keep only surfaces facing up, so walls and furniture sides are ignored.
-        if (normal.y > 0.92) { found = r; break; }
+        if (normal.y > minUp) { found = r; break; }
       }
+      if (results.length && !found) tiltedFrames++;
+      else if (found && minUp > 0.8) tiltedFrames = 0;
       if (found) {
         mat.decompose(target, hitQuat, tmpScale);
         if (!reticle.visible) { smooth.copy(target); stable = 0; }
         else {
           // A sudden jump means the detected floor changed; start counting again.
-          if (target.distanceTo(smooth) > 0.25) stable = 0;
+          if (target.distanceTo(smooth) > 0.4) stable = 0;
           smooth.lerp(target, 0.2);
         }
         reticle.visible = true;
@@ -396,6 +413,7 @@ renderer.setAnimationLoop((time, frame) => {
       ui.place.disabled = !ready;
       if (ready) setStatus('Floor found. Aim the ring and tap Place here.', 'ready');
       else if (reticle.visible) setStatus('Hold steady…');
+      else if (results.length) setStatus('A surface is visible but looks tilted. Aim at open floor…');
       else setStatus('Looking for the floor… move the phone slowly side to side.');
 
       if (placeRequested) {
@@ -422,8 +440,7 @@ renderer.setAnimationLoop((time, frame) => {
       }
     }
   }
-  renderer.render(scene, camera);
-});
+}
 
 window.addEventListener('resize', () => {
   if (renderer.xr.isPresenting) return;
